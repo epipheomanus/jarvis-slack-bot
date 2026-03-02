@@ -10,11 +10,14 @@ const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON; // JSON string
 const GOOGLE_DOC_ID = "1QDR2OwIg5vKWy0mKthaOi0pJo46dY_4eMRhVEujhpUk";
 
-// LinkedIn OAuth config
+// LinkedIn OAuth config (Epipheo Page Manager app)
 const LINKEDIN_CLIENT_ID = process.env.LINKEDIN_CLIENT_ID;
 const LINKEDIN_CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET;
 const LINKEDIN_REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI || "https://jarvis-slack-bot-production.up.railway.app/linkedin/callback";
-const LINKEDIN_SCOPES = "w_member_social";
+const LINKEDIN_SCOPES = "w_organization_social r_organization_social";
+
+// LinkedIn API version (YYYYMM format)
+const LINKEDIN_API_VERSION = "202502";
 
 // In-memory token store (also persisted to env-friendly log)
 let linkedinTokens = {
@@ -142,9 +145,53 @@ function classifyMessage(text) {
   return "feedback";
 }
 
+// ─── LinkedIn helper: get valid access token (auto-refresh) ─────────────────
+async function getLinkedInAccessToken() {
+  if (!linkedinTokens.access_token) {
+    throw new Error("Not authorized. Visit /linkedin/auth first.");
+  }
+
+  // Auto-refresh if expired and we have a refresh token
+  if (linkedinTokens.expires_at && Date.now() > linkedinTokens.expires_at && linkedinTokens.refresh_token) {
+    try {
+      const refreshRes = await axios.post(
+        "https://www.linkedin.com/oauth/v2/accessToken",
+        new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: linkedinTokens.refresh_token,
+          client_id: LINKEDIN_CLIENT_ID,
+          client_secret: LINKEDIN_CLIENT_SECRET,
+        }).toString(),
+        { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+      );
+      linkedinTokens.access_token = refreshRes.data.access_token;
+      linkedinTokens.expires_at = Date.now() + refreshRes.data.expires_in * 1000;
+      if (refreshRes.data.refresh_token) {
+        linkedinTokens.refresh_token = refreshRes.data.refresh_token;
+      }
+      console.log("[LinkedIn] Token refreshed successfully.");
+    } catch (refreshErr) {
+      console.error("[LinkedIn] Token refresh failed:", refreshErr.response?.data || refreshErr.message);
+      throw new Error("Token expired and refresh failed. Re-authorize at /linkedin/auth.");
+    }
+  }
+
+  return linkedinTokens.access_token;
+}
+
+// ─── LinkedIn helper: standard headers for REST API ─────────────────────────
+function linkedinRestHeaders(accessToken) {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    "LinkedIn-Version": LINKEDIN_API_VERSION,
+    "X-Restli-Protocol-Version": "2.0.0",
+  };
+}
+
 // ─── Express app ─────────────────────────────────────────────────────────────
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 // Health check
 app.get("/health", (_req, res) => {
@@ -166,6 +213,9 @@ app.get("/", (_req, res) => {
       linkedin_callback: "GET /linkedin/callback",
       linkedin_status: "GET /linkedin/status",
       linkedin_post: "POST /linkedin/post",
+      linkedin_org_lookup: "GET /linkedin/org-lookup?vanityName=epipheo",
+      linkedin_post_company: "POST /linkedin/post-company",
+      linkedin_upload_image: "POST /linkedin/upload-image",
       health: "GET /health",
     },
   });
@@ -224,30 +274,37 @@ app.get("/linkedin/callback", async (req, res) => {
       console.log(`[LinkedIn] Refresh token received. Expires in ${refresh_token_expires_in}s.`);
     }
 
-    // Get user profile to confirm identity
-    let profileName = "Unknown";
+    // Try to get organization admin info to confirm access
+    let orgInfo = "Organization access granted";
     try {
-      const profileRes = await axios.get("https://api.linkedin.com/v2/me", {
-        headers: { Authorization: `Bearer ${access_token}` },
-      });
-      const firstName = profileRes.data.localizedFirstName || "";
-      const lastName = profileRes.data.localizedLastName || "";
-      profileName = `${firstName} ${lastName}`.trim() || "Unknown";
-      linkedinTokens.profile_name = profileName;
-      linkedinTokens.profile_sub = profileRes.data.id;
-    } catch (profileErr) {
-      console.warn("[LinkedIn] Could not fetch profile:", profileErr.message);
+      const orgRes = await axios.get(
+        "https://api.linkedin.com/rest/organizationAcls?q=roleAssignee&role=ADMINISTRATOR&projection=(elements*(organization~(localizedName,vanityName)))",
+        { headers: linkedinRestHeaders(access_token) }
+      );
+      const orgs = orgRes.data.elements || [];
+      if (orgs.length > 0) {
+        const orgNames = orgs.map(o => {
+          const org = o["organization~"];
+          return org ? `${org.localizedName} (${org.vanityName})` : "Unknown org";
+        });
+        orgInfo = `Admin of: ${orgNames.join(", ")}`;
+        linkedinTokens.organizations = orgs;
+      }
+    } catch (orgErr) {
+      console.warn("[LinkedIn] Could not fetch org info:", orgErr.response?.data || orgErr.message);
+      orgInfo = "Could not verify organization access (this is OK — token is still valid)";
     }
 
     res.send(`
       <html>
       <body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
         <h1 style="color: #0A66C2;">✅ LinkedIn Connected!</h1>
-        <p>Authorized as: <strong>${profileName}</strong></p>
+        <p><strong>Epipheo Page Manager</strong> app authorized.</p>
+        <p>${orgInfo}</p>
         <p>Access token expires: <strong>${new Date(linkedinTokens.expires_at).toLocaleString()}</strong></p>
         ${refresh_token ? '<p>Refresh token: ✅ Received (auto-renewal enabled)</p>' : '<p>Refresh token: ❌ Not provided (will need to re-authorize when token expires)</p>'}
         <hr>
-        <p style="color: #666;">You can close this window. Jarvis can now post to LinkedIn on your behalf.</p>
+        <p style="color: #666;">You can close this window. Jarvis can now post to the Epipheo LinkedIn company page.</p>
       </body>
       </html>
     `);
@@ -258,7 +315,7 @@ app.get("/linkedin/callback", async (req, res) => {
 });
 
 // Status check
-app.get("/linkedin/status", (_req, res) => {
+app.get("/linkedin/status", async (_req, res) => {
   if (!linkedinTokens.access_token) {
     return res.json({
       connected: false,
@@ -270,80 +327,294 @@ app.get("/linkedin/status", (_req, res) => {
   res.json({
     connected: true,
     expired,
-    profile_name: linkedinTokens.profile_name || null,
     expires_at: linkedinTokens.expires_at ? new Date(linkedinTokens.expires_at).toISOString() : null,
     has_refresh_token: !!linkedinTokens.refresh_token,
+    scopes: LINKEDIN_SCOPES,
+    api_version: LINKEDIN_API_VERSION,
   });
 });
 
-// Post to LinkedIn (company page or personal)
-app.post("/linkedin/post", async (req, res) => {
-  if (!linkedinTokens.access_token) {
-    return res.status(401).json({ error: "Not authorized. Visit /linkedin/auth first." });
-  }
-
-  // Auto-refresh if expired and we have a refresh token
-  if (linkedinTokens.expires_at && Date.now() > linkedinTokens.expires_at && linkedinTokens.refresh_token) {
-    try {
-      const refreshRes = await axios.post(
-        "https://www.linkedin.com/oauth/v2/accessToken",
-        new URLSearchParams({
-          grant_type: "refresh_token",
-          refresh_token: linkedinTokens.refresh_token,
-          client_id: LINKEDIN_CLIENT_ID,
-          client_secret: LINKEDIN_CLIENT_SECRET,
-        }).toString(),
-        { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
-      );
-      linkedinTokens.access_token = refreshRes.data.access_token;
-      linkedinTokens.expires_at = Date.now() + refreshRes.data.expires_in * 1000;
-      if (refreshRes.data.refresh_token) {
-        linkedinTokens.refresh_token = refreshRes.data.refresh_token;
-      }
-      console.log("[LinkedIn] Token refreshed successfully.");
-    } catch (refreshErr) {
-      console.error("[LinkedIn] Token refresh failed:", refreshErr.response?.data || refreshErr.message);
-      return res.status(401).json({ error: "Token expired and refresh failed. Re-authorize at /linkedin/auth." });
-    }
-  }
-
-  const { text, author } = req.body;
-  // author should be a LinkedIn URN like "urn:li:organization:XXXXX" or "urn:li:person:XXXXX"
-  // If not provided, post as the authenticated user
-  const authorUrn = author || `urn:li:person:${linkedinTokens.profile_sub}`;
-
-  if (!text) {
-    return res.status(400).json({ error: "Missing 'text' in request body." });
-  }
-
+// ─── Organization Lookup ────────────────────────────────────────────────────
+// GET /linkedin/org-lookup?vanityName=epipheo
+app.get("/linkedin/org-lookup", async (req, res) => {
   try {
-    const postBody = {
-      author: authorUrn,
-      lifecycleState: "PUBLISHED",
-      specificContent: {
-        "com.linkedin.ugc.ShareContent": {
-          shareCommentary: { text },
-          shareMediaCategory: "NONE",
-        },
-      },
-      visibility: {
-        "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC",
-      },
-    };
+    const accessToken = await getLinkedInAccessToken();
+    const { vanityName } = req.query;
 
-    const postRes = await axios.post("https://api.linkedin.com/v2/ugcPosts", postBody, {
-      headers: {
-        Authorization: `Bearer ${linkedinTokens.access_token}`,
-        "Content-Type": "application/json",
-        "X-Restli-Protocol-Version": "2.0.0",
+    if (!vanityName) {
+      return res.status(400).json({ error: "Missing 'vanityName' query parameter. Example: /linkedin/org-lookup?vanityName=epipheo" });
+    }
+
+    // Look up organization by vanity name
+    const orgRes = await axios.get(
+      `https://api.linkedin.com/rest/organizations?q=vanityName&vanityName=${encodeURIComponent(vanityName)}`,
+      { headers: linkedinRestHeaders(accessToken) }
+    );
+
+    const elements = orgRes.data.elements || [];
+    if (elements.length === 0) {
+      return res.status(404).json({ error: `No organization found with vanityName "${vanityName}".` });
+    }
+
+    const org = elements[0];
+    res.json({
+      success: true,
+      organization: {
+        id: org.id,
+        urn: `urn:li:organization:${org.id}`,
+        name: org.localizedName,
+        vanityName: org.vanityName,
+        description: org.localizedDescription || null,
+        logoUrl: org.logoV2 ? org.logoV2["original~"]?.elements?.[0]?.identifiers?.[0]?.identifier : null,
       },
     });
+  } catch (err) {
+    console.error("[LinkedIn] Org lookup error:", err.response?.data || err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
 
-    console.log(`[LinkedIn] Post published successfully. ID: ${postRes.data.id}`);
-    res.json({ success: true, post_id: postRes.data.id });
+// ─── List Administered Organizations ────────────────────────────────────────
+// GET /linkedin/org-admin-list
+app.get("/linkedin/org-admin-list", async (_req, res) => {
+  try {
+    const accessToken = await getLinkedInAccessToken();
+
+    const orgRes = await axios.get(
+      "https://api.linkedin.com/rest/organizationAcls?q=roleAssignee&role=ADMINISTRATOR",
+      { headers: linkedinRestHeaders(accessToken) }
+    );
+
+    const elements = orgRes.data.elements || [];
+    const organizations = elements.map(e => ({
+      organizationUrn: e.organization,
+      role: e.role,
+      state: e.state,
+    }));
+
+    res.json({ success: true, count: organizations.length, organizations });
+  } catch (err) {
+    console.error("[LinkedIn] Org admin list error:", err.response?.data || err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ─── Post to LinkedIn Company Page (REST API) ──────────────────────────────
+// POST /linkedin/post-company
+// Body: { "orgId": "12345", "text": "Post text", "imageUrn": "(optional)", "videoUrn": "(optional)" }
+app.post("/linkedin/post-company", async (req, res) => {
+  try {
+    const accessToken = await getLinkedInAccessToken();
+    const { orgId, text, imageUrn, videoUrn } = req.body;
+
+    if (!orgId) {
+      return res.status(400).json({ error: "Missing 'orgId' in request body. Use /linkedin/org-lookup to find it." });
+    }
+    if (!text && !imageUrn && !videoUrn) {
+      return res.status(400).json({ error: "Must provide at least 'text', 'imageUrn', or 'videoUrn'." });
+    }
+
+    const postBody = {
+      author: `urn:li:organization:${orgId}`,
+      commentary: text || "",
+      visibility: "PUBLIC",
+      distribution: {
+        feedDistribution: "MAIN_FEED",
+        targetEntities: [],
+        thirdPartyDistributionChannels: [],
+      },
+      lifecycleState: "PUBLISHED",
+      isReshareDisabledByAuthor: false,
+    };
+
+    // Add image content if provided
+    if (imageUrn) {
+      postBody.content = {
+        media: {
+          title: "Image",
+          id: imageUrn,
+        },
+      };
+    }
+
+    // Add video content if provided
+    if (videoUrn) {
+      postBody.content = {
+        media: {
+          title: "Video",
+          id: videoUrn,
+        },
+      };
+    }
+
+    const postRes = await axios.post("https://api.linkedin.com/rest/posts", postBody, {
+      headers: linkedinRestHeaders(accessToken),
+    });
+
+    // The REST API returns 201 with x-restli-id header for the post URN
+    const postUrn = postRes.headers["x-restli-id"] || postRes.data?.id || "created";
+    console.log(`[LinkedIn] Company page post published. URN: ${postUrn}`);
+    res.json({ success: true, post_urn: postUrn });
+  } catch (err) {
+    console.error("[LinkedIn] Company post error:", err.response?.data || err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ─── Upload Image to LinkedIn (for company page posts) ─────────────────────
+// POST /linkedin/upload-image
+// Body: { "orgId": "12345", "imageUrl": "https://example.com/image.jpg" }
+app.post("/linkedin/upload-image", async (req, res) => {
+  try {
+    const accessToken = await getLinkedInAccessToken();
+    const { orgId, imageUrl } = req.body;
+
+    if (!orgId || !imageUrl) {
+      return res.status(400).json({ error: "Missing 'orgId' or 'imageUrl' in request body." });
+    }
+
+    // Step 1: Initialize the image upload
+    const initRes = await axios.post(
+      "https://api.linkedin.com/rest/images?action=initializeUpload",
+      {
+        initializeUploadRequest: {
+          owner: `urn:li:organization:${orgId}`,
+        },
+      },
+      { headers: linkedinRestHeaders(accessToken) }
+    );
+
+    const { uploadUrl, image: imageUrn } = initRes.data.value;
+    console.log(`[LinkedIn] Image upload initialized. URN: ${imageUrn}`);
+
+    // Step 2: Download the image from the provided URL
+    const imageResponse = await axios.get(imageUrl, { responseType: "arraybuffer" });
+    const imageBuffer = Buffer.from(imageResponse.data);
+
+    // Step 3: Upload the image binary to LinkedIn's upload URL
+    await axios.put(uploadUrl, imageBuffer, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/octet-stream",
+      },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    });
+
+    console.log(`[LinkedIn] Image uploaded successfully. URN: ${imageUrn}`);
+    res.json({ success: true, imageUrn });
+  } catch (err) {
+    console.error("[LinkedIn] Image upload error:", err.response?.data || err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ─── Upload Video to LinkedIn (for company page posts) ─────────────────────
+// POST /linkedin/upload-video
+// Body: { "orgId": "12345", "videoUrl": "https://example.com/video.mp4", "fileSizeBytes": 12345678 }
+app.post("/linkedin/upload-video", async (req, res) => {
+  try {
+    const accessToken = await getLinkedInAccessToken();
+    const { orgId, videoUrl, fileSizeBytes } = req.body;
+
+    if (!orgId || !videoUrl) {
+      return res.status(400).json({ error: "Missing 'orgId' or 'videoUrl' in request body." });
+    }
+
+    // Step 1: Initialize the video upload
+    const initRes = await axios.post(
+      "https://api.linkedin.com/rest/videos?action=initializeUpload",
+      {
+        initializeUploadRequest: {
+          owner: `urn:li:organization:${orgId}`,
+          fileSizeBytes: fileSizeBytes || 0,
+          uploadCaptions: false,
+          uploadThumbnail: false,
+        },
+      },
+      { headers: linkedinRestHeaders(accessToken) }
+    );
+
+    const { uploadInstructions, video: videoUrn } = initRes.data.value;
+    console.log(`[LinkedIn] Video upload initialized. URN: ${videoUrn}`);
+
+    // Step 2: Download the video from the provided URL
+    const videoResponse = await axios.get(videoUrl, { responseType: "arraybuffer" });
+    const videoBuffer = Buffer.from(videoResponse.data);
+
+    // Step 3: Upload each chunk (usually single chunk for small videos)
+    for (const instruction of uploadInstructions) {
+      const start = instruction.firstByte || 0;
+      const end = instruction.lastByte || videoBuffer.length;
+      const chunk = videoBuffer.slice(start, end + 1);
+
+      await axios.put(instruction.uploadUrl, chunk, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/octet-stream",
+        },
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+      });
+    }
+
+    // Step 4: Finalize the upload
+    await axios.post(
+      "https://api.linkedin.com/rest/videos?action=finalizeUpload",
+      {
+        finalizeUploadRequest: {
+          video: videoUrn,
+          uploadToken: "",
+          uploadedPartIds: [],
+        },
+      },
+      { headers: linkedinRestHeaders(accessToken) }
+    );
+
+    console.log(`[LinkedIn] Video uploaded successfully. URN: ${videoUrn}`);
+    res.json({ success: true, videoUrn });
+  } catch (err) {
+    console.error("[LinkedIn] Video upload error:", err.response?.data || err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ─── Legacy: Post to LinkedIn (personal profile via UGC API) ────────────────
+// Kept for backward compatibility
+app.post("/linkedin/post", async (req, res) => {
+  try {
+    const accessToken = await getLinkedInAccessToken();
+    const { text, author } = req.body;
+    const authorUrn = author || `urn:li:person:${linkedinTokens.profile_sub}`;
+
+    if (!text) {
+      return res.status(400).json({ error: "Missing 'text' in request body." });
+    }
+
+    // Use the new REST API for posting
+    const postBody = {
+      author: authorUrn,
+      commentary: text,
+      visibility: "PUBLIC",
+      distribution: {
+        feedDistribution: "MAIN_FEED",
+        targetEntities: [],
+        thirdPartyDistributionChannels: [],
+      },
+      lifecycleState: "PUBLISHED",
+      isReshareDisabledByAuthor: false,
+    };
+
+    const postRes = await axios.post("https://api.linkedin.com/rest/posts", postBody, {
+      headers: linkedinRestHeaders(accessToken),
+    });
+
+    const postUrn = postRes.headers["x-restli-id"] || postRes.data?.id || "created";
+    console.log(`[LinkedIn] Post published successfully. URN: ${postUrn}`);
+    res.json({ success: true, post_urn: postUrn });
   } catch (err) {
     console.error("[LinkedIn] Post error:", err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data || err.message });
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
   }
 });
 
@@ -421,4 +692,8 @@ app.listen(PORT, () => {
   console.log(`   Slack events: http://localhost:${PORT}/slack/events`);
   console.log(`   LinkedIn auth: http://localhost:${PORT}/linkedin/auth`);
   console.log(`   LinkedIn status: http://localhost:${PORT}/linkedin/status`);
+  console.log(`   Org lookup: http://localhost:${PORT}/linkedin/org-lookup?vanityName=epipheo`);
+  console.log(`   Post to company: POST http://localhost:${PORT}/linkedin/post-company`);
+  console.log(`   Upload image: POST http://localhost:${PORT}/linkedin/upload-image`);
+  console.log(`   Upload video: POST http://localhost:${PORT}/linkedin/upload-video`);
 });
