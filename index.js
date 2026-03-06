@@ -219,6 +219,9 @@ app.get("/", (_req, res) => {
       quickbooks_auth: "GET /quickbooks/auth",
       quickbooks_callback: "GET /quickbooks/callback",
       quickbooks_tokens: "GET /quickbooks/tokens (x-jarvis-key header required)",
+      salesforce_auth: "GET /salesforce/auth",
+      salesforce_callback: "GET /salesforce/callback",
+      salesforce_tokens: "GET /salesforce/tokens (x-jarvis-key header required)",
       health: "GET /health",
     },
   });
@@ -787,6 +790,108 @@ app.get("/quickbooks/tokens", (req, res) => {
   res.json(qboTokens);
 });
 
+// ─── Salesforce OAuth ──────────────────────────────────────────────────────
+
+const SF_CLIENT_ID = process.env.SF_CLIENT_ID;
+const SF_CLIENT_SECRET = process.env.SF_CLIENT_SECRET;
+const SF_REDIRECT_URI = process.env.SF_REDIRECT_URI || "https://jarvis-slack-bot-production.up.railway.app/salesforce/callback";
+const SF_AUTH_ENDPOINT = "https://login.salesforce.com/services/oauth2/authorize";
+const SF_TOKEN_ENDPOINT = "https://login.salesforce.com/services/oauth2/token";
+const SF_SCOPES = "full refresh_token offline_access";
+
+// In-memory Salesforce token store
+let sfTokens = {
+  access_token: null,
+  refresh_token: null,
+  instance_url: null,
+  expires_at: null,
+  received_at: null,
+};
+
+// Step 1: Redirect user to Salesforce authorization page
+app.get("/salesforce/auth", (req, res) => {
+  const state = Math.random().toString(36).substring(2, 15);
+  const authUrl = `${SF_AUTH_ENDPOINT}?response_type=code&client_id=${SF_CLIENT_ID}&redirect_uri=${encodeURIComponent(SF_REDIRECT_URI)}&scope=${encodeURIComponent(SF_SCOPES)}&state=${state}`;
+  console.log("[Salesforce] Redirecting to authorization URL.");
+  res.redirect(authUrl);
+});
+
+// Step 2: Handle OAuth callback from Salesforce
+app.get("/salesforce/callback", async (req, res) => {
+  const { code, state, error, error_description } = req.query;
+
+  if (error) {
+    console.error(`[Salesforce] OAuth error: ${error} — ${error_description}`);
+    return res.status(400).send(`<h1>Salesforce Authorization Failed</h1><p>${error}: ${error_description}</p>`);
+  }
+
+  if (!code) {
+    return res.status(400).send("<h1>Missing authorization code</h1>");
+  }
+
+  try {
+    const tokenResponse = await axios.post(
+      SF_TOKEN_ENDPOINT,
+      new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: SF_REDIRECT_URI,
+        client_id: SF_CLIENT_ID,
+        client_secret: SF_CLIENT_SECRET,
+      }).toString(),
+      {
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+      }
+    );
+
+    const { access_token, refresh_token, instance_url, issued_at, token_type } = tokenResponse.data;
+
+    sfTokens = {
+      access_token,
+      refresh_token: refresh_token || null,
+      instance_url: instance_url || null,
+      expires_at: issued_at ? parseInt(issued_at) + 3600 * 1000 : Date.now() + 3600 * 1000,
+      received_at: new Date().toISOString(),
+      token_type: token_type || "Bearer",
+    };
+
+    console.log(`[Salesforce] Authorization successful. Instance URL: ${instance_url}.`);
+
+    res.send(`
+      <html>
+      <body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
+        <h1 style="color: #00A1E0;">&#x2705; Salesforce Connected!</h1>
+        <p>Authorization successful.</p>
+        <p>Instance URL: <strong>${instance_url}</strong></p>
+        <p>Access token received: &#x2705;</p>
+        ${refresh_token ? '<p>Refresh token: &#x2705; Received (auto-renewal enabled)</p>' : '<p>Refresh token: &#x274C; Not provided</p>'}
+        <p>Authorized at: <strong>${new Date().toLocaleString()}</strong></p>
+        <hr>
+        <p style="color: #666;">You can close this window. Jarvis now has a valid Salesforce access token.</p>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("[Salesforce] Token exchange error:", err.response?.data || err.message);
+    res.status(500).send(`<h1>Token Exchange Failed</h1><pre>${JSON.stringify(err.response?.data || err.message, null, 2)}</pre>`);
+  }
+});
+
+// Retrieve Salesforce tokens (for Jarvis internal use)
+app.get("/salesforce/tokens", (req, res) => {
+  const authHeader = req.headers["x-jarvis-key"];
+  if (authHeader !== "jarvis-internal-2026") {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+  if (!sfTokens.access_token) {
+    return res.status(404).json({ error: "No Salesforce tokens available. Visit /salesforce/auth first." });
+  }
+  res.json(sfTokens);
+});
+
 // ─── Start server ────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`🤖 Jarvis Slack Bot listening on port ${PORT}`);
@@ -798,4 +903,7 @@ app.listen(PORT, () => {
   console.log(`   Post to company: POST http://localhost:${PORT}/linkedin/post-company`);
   console.log(`   Upload image: POST http://localhost:${PORT}/linkedin/upload-image`);
   console.log(`   Upload video: POST http://localhost:${PORT}/linkedin/upload-video`);
+  console.log(`   Salesforce auth: http://localhost:${PORT}/salesforce/auth`);
+  console.log(`   Salesforce callback: http://localhost:${PORT}/salesforce/callback`);
+  console.log(`   Salesforce tokens: GET http://localhost:${PORT}/salesforce/tokens`);
 });
