@@ -216,6 +216,9 @@ app.get("/", (_req, res) => {
       linkedin_org_lookup: "GET /linkedin/org-lookup?vanityName=epipheo",
       linkedin_post_company: "POST /linkedin/post-company",
       linkedin_upload_image: "POST /linkedin/upload-image",
+      quickbooks_auth: "GET /quickbooks/auth",
+      quickbooks_callback: "GET /quickbooks/callback",
+      quickbooks_tokens: "GET /quickbooks/tokens (x-jarvis-key header required)",
       health: "GET /health",
     },
   });
@@ -683,6 +686,105 @@ app.post("/slack/events", async (req, res) => {
       await postSlackMessage(channel, `📝 Thanks <@${user}>, I've noted your feedback.`);
     }
   }
+});
+
+// ─── QuickBooks Online OAuth ────────────────────────────────────────────────
+
+const QBO_CLIENT_ID = process.env.QBO_CLIENT_ID || "ABQ8sb9lLaLRhKqKqhZFQf8KK3lJT0vYztIUE9XqH0K193a0Ud";
+const QBO_CLIENT_SECRET = process.env.QBO_CLIENT_SECRET || "CXh0T14JmvzAC5XZfN87asUp4K2DOVg2F48Lz2j5";
+const QBO_REDIRECT_URI = process.env.QBO_REDIRECT_URI || "https://jarvis-slack-bot-production.up.railway.app/quickbooks/callback";
+const QBO_SCOPES = "com.intuit.quickbooks.accounting";
+const QBO_AUTH_ENDPOINT = "https://appcenter.intuit.com/connect/oauth2";
+const QBO_TOKEN_ENDPOINT = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
+
+// In-memory QBO token store
+let qboTokens = {
+  access_token: null,
+  refresh_token: null,
+  expires_at: null,
+  realm_id: null,
+  received_at: null,
+};
+
+// Step 1: Redirect user to Intuit authorization page
+app.get("/quickbooks/auth", (req, res) => {
+  const state = Math.random().toString(36).substring(2, 15);
+  const authUrl = `${QBO_AUTH_ENDPOINT}?client_id=${QBO_CLIENT_ID}&response_type=code&scope=${encodeURIComponent(QBO_SCOPES)}&redirect_uri=${encodeURIComponent(QBO_REDIRECT_URI)}&state=${state}`;
+  console.log("[QBO] Redirecting to authorization URL.");
+  res.redirect(authUrl);
+});
+
+// Step 2: Handle OAuth callback from Intuit
+app.get("/quickbooks/callback", async (req, res) => {
+  const { code, realmId, state, error, error_description } = req.query;
+
+  if (error) {
+    console.error(`[QBO] OAuth error: ${error} — ${error_description}`);
+    return res.status(400).send(`<h1>QuickBooks Authorization Failed</h1><p>${error}: ${error_description}</p>`);
+  }
+
+  if (!code) {
+    return res.status(400).send("<h1>Missing authorization code</h1>");
+  }
+
+  try {
+    const credentials = Buffer.from(`${QBO_CLIENT_ID}:${QBO_CLIENT_SECRET}`).toString("base64");
+    const tokenResponse = await axios.post(
+      QBO_TOKEN_ENDPOINT,
+      new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: QBO_REDIRECT_URI,
+      }).toString(),
+      {
+        headers: {
+          Authorization: `Basic ${credentials}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+      }
+    );
+
+    const { access_token, refresh_token, expires_in } = tokenResponse.data;
+
+    qboTokens = {
+      access_token,
+      refresh_token,
+      expires_at: Date.now() + (expires_in || 3600) * 1000,
+      realm_id: realmId || null,
+      received_at: new Date().toISOString(),
+    };
+
+    console.log(`[QBO] Authorization successful. Realm ID: ${realmId}. Token expires in ${expires_in}s.`);
+
+    res.send(`
+      <html>
+      <body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
+        <h1 style="color: #2CA01C;">&#x2705; QuickBooks Online Connected!</h1>
+        <p>Authorization successful for Realm ID: <strong>${realmId}</strong></p>
+        <p>Access token expires: <strong>${new Date(qboTokens.expires_at).toLocaleString()}</strong></p>
+        <p>Refresh token: &#x2705; Received</p>
+        <hr>
+        <p style="color: #666;">You can close this window. Jarvis now has a fresh QBO refresh token.</p>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("[QBO] Token exchange error:", err.response?.data || err.message);
+    res.status(500).send(`<h1>Token Exchange Failed</h1><pre>${JSON.stringify(err.response?.data || err.message, null, 2)}</pre>`);
+  }
+});
+
+// Retrieve QBO tokens (for Jarvis internal use)
+app.get("/quickbooks/tokens", (req, res) => {
+  const authHeader = req.headers["x-jarvis-key"];
+  if (authHeader !== "jarvis-internal-2026") {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+  if (!qboTokens.access_token) {
+    return res.status(404).json({ error: "No QBO tokens available. Visit /quickbooks/auth first." });
+  }
+  res.json(qboTokens);
 });
 
 // ─── Start server ────────────────────────────────────────────────────────────
